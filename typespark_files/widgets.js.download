@@ -1,0 +1,320 @@
+import DboxWidgetLoading from "/widgets/donation_form/base/loading.js";
+
+class DboxWidget extends HTMLElement {
+  static observedAttributes = [
+    // Some attributes might be exclusive to be used in some certain widgets
+    "modal",
+    // Related to both Kiosk and Donation Form
+    "page",
+    "currency",
+    "interval",
+    "page-id",
+    "amount",
+    // Related only to Donation Form
+    "payment-method",
+    "stripe-payment-method",
+    "cover-fee-accepted",
+    "quick-donate-accepted",
+    "designation",
+    "phone",
+    "email",
+    "first-name",
+    "last-name",
+    "address",
+    "city",
+    "country",
+    "state",
+    "zip-code",
+    "enable-auto-scroll",
+    "show-content",
+    // Related only to Popup Form
+    "content-panel",
+    "show-icon",
+    "button-type",
+    "button-label",
+    "button-size",
+    "button-color",
+    "hide-goal-meter",
+    "sticky-position",
+    "regular-position"
+  ];
+
+  static typesAssetUrl = {
+    donation_form: "https://donorbox.org/assets/widgets/donation_form-b51b9b7f0afefada4ed0bc136a4033e2982043f4b09a667f1610b0f2561c587f.js",
+    kiosk: "https://donorbox.org/assets/widgets/kiosk-a972e8add94f560e4b49c6432a412b0cc63b798caf7b6a5d6d22c1a2fda20e13.js",
+    event: "https://donorbox.org/assets/widgets/ticket_form-bdb31472b2abda3ea5940aae176118df5b0a3e4e1f11b00c2669d5554d53a132.js",
+    event_kiosk: "https://donorbox.org/assets/widgets/event_kiosk-6810f69e3ef8f24a2f5acb1b3cc4554701a7e485bdecb4a2b7c8ccb1228f5033.js",
+    popup: "https://donorbox.org/assets/widgets/popup_form-632f75eac3604095be390cdc330e9fa865c82b4949f8472ebd0e2929d20f4977.js",
+  };
+
+  static typeResourcePath = {
+    donation_form: "donation_forms",
+    kiosk: "card_reader",
+    event: "ticket_forms",
+    event_kiosk: "event_kiosk",
+    popup: "popup_forms",
+  };
+
+  constructor() {
+    super();
+
+    this.type = this.getAttribute('type') || 'donation_form';
+
+    if (!DboxWidget.typeResourcePath[this.type]) {
+      console.warn(`the widget type "${this.type}" is not supported, falling back to "donation_form"`);
+      this.type = 'donation_form';
+    }
+
+    let resourcePath = DboxWidget.typeResourcePath[this.type];
+
+    this.HOST_URL = "https://donorbox.org";
+    this.ASSET_URL = DboxWidget.typesAssetUrl[this.type];
+    this.RESOURCE_URL = `${this.HOST_URL}/widgets/${resourcePath}/`;
+    this.APPSIGNAL_FRONTEND_API_KEY = "ca129e05-3d50-4d15-b84e-6a36b17bfc2e";
+
+    const autoWidth = this.type.startsWith('event');
+
+    this.defaultStyle = {
+      position: autoWidth ? 'initial' : 'relative',
+      display: 'block',
+      fontSize: '12px',
+      width: autoWidth ? 'auto' : '',
+      maxInlineSize: autoWidth ? '525px' : '425px',
+      minWidth: autoWidth ? 'auto' : '320px',
+      minInlineSize: autoWidth ? 'auto' : '320px'
+    };
+
+    this.defaultAttributes = {
+      modal: false,
+      tabIndex: 0,
+      'aria-busy': true
+    };
+
+    this.setDefaultStyle();
+    this.setDefaultAttributes();
+
+    if (this.shadowRoot) {
+      this.shadow = this.shadowRoot;
+      this.ssr = true;
+      const dboxCampaignData = this.shadow.querySelector('#dbox_campaign_data');
+      this.campaignData = JSON.parse(dboxCampaignData.textContent);
+    } else {
+      if (!this.attachShadow) return false;
+      this.ssr = false;
+      this.shadow = this.attachShadow({ mode: "open" });
+      this.loading = new DboxWidgetLoading(this.shadow, this.getAttribute('campaign'));
+    }
+
+    this.components = {};
+    if (this.getAttribute('enable-auto-scroll')) {
+      this.addEventListener('dbox:page-changed', this.scrollToTop);
+    }
+  }
+
+  async connectedCallback() {
+    if (this.ssr || !this.campaignData) {
+      this.campaign = this.getAttribute('campaign');
+      window.DBOX = await import(this.ASSET_URL);
+      this.attachStyles()
+
+      this.widgetClass = DBOX[`Dbox_${this.type}`]
+
+      if (this.ssr) {
+        this.loadSuccess();
+      } else {
+        this.fetchCampaign();
+        this.addEventListener('dbox:show-content-changed', this.fetchCampaign.bind(this));
+      }
+    }
+  }
+
+  disconnectedCallback() {
+    if (this.widgetClass.disconnectedCallback) {
+      this.widgetClass.disconnectedCallback();
+    }
+  }
+
+  attributeChangedCallback(attributeName, oldValue, newValue) {
+    if (oldValue === newValue) { return; }
+
+    Object.values(this.components)
+      .filter(component => (component.observedAttributes?.includes(attributeName)))
+      .map(component => {
+        if (this.isValidValue(attributeName, newValue)) {
+          component.attributeChangedCallback(attributeName, oldValue, newValue);
+        } else if (oldValue && this.isValidValue(attributeName, oldValue))  {
+          this.setAttribute(attributeName, oldValue);
+        } else {
+          this.removeAttribute(attributeName);
+        }
+      });
+
+    this.dispatchEvent(new CustomEvent(`dbox:${attributeName}-changed`, { detail: { from: oldValue, to: newValue }}));
+  }
+
+  setDefaultStyle() {
+    Object.keys(this.defaultStyle).forEach(property => {
+      if (!this.style[property])
+        this.style[property] = this.defaultStyle[property];
+    });
+  }
+
+  setDefaultAttributes() {
+    Object.keys(this.defaultAttributes).forEach(attribute => {
+      this.setAttribute(attribute, this.defaultAttributes[attribute]);
+    });
+  }
+
+  fetchCampaign() {
+    let campaignUrl = `${this.RESOURCE_URL}${this.campaign}`;
+    const params = [];
+    if (this.getAttribute('preview') === "true") {
+      params.push(`preview=${Date.now()}`);
+    }
+    if (this.getAttribute('show-content') === "true") {
+      params.push(`show_content=true`);
+    }
+    if (params.length) {
+      campaignUrl = `${campaignUrl}?${params.join('&')}`;
+    }
+
+    fetch(campaignUrl).then((response) => {
+      if (response.ok) {
+        response.text().then((text) => {
+          this.responseHTML = new DOMParser().parseFromString(text, "text/html");
+          this.attachDonationFormToShadowDom();
+          this.loadSuccess(response);
+        });
+      } else {
+        this.loading?.loadError(response);
+      }
+    }).catch((error) => {
+      this.loading?.loadError(error);
+    });
+  }
+
+  loadSuccess(response) {
+    this.setAttribute('aria-busy', false);
+
+    this.loading?.complete();
+
+    if (this.widgetClass.onSuccess) {
+      this.widgetClass.onSuccess(this)
+    }
+
+    this.loadModules(this.widgetClass.modules, this.components);
+
+    Object.values(this.components).forEach((component) => {
+      component.observedAttributes?.forEach((attribute) => {
+        const attributeValue = this.getAttribute(attribute);
+
+        if (this.isValidValue(attribute, attributeValue)) {
+          component.attributeChangedCallback(attribute, null, attributeValue);
+        }
+      });
+    });
+
+    this.dispatchEvent(new CustomEvent('dbox:campaign-loaded', { detail: { element: this }}));
+  }
+
+  loadModules(modules, target = this.components, callback) {
+    modules.filter(module => !!module).forEach((module) => {
+      try {
+        const instance = new module(this);
+        target[instance.name || module.name] = instance;
+      } catch (error) {
+        this.reportError(error);
+      }
+    });
+
+    if (callback) { callback(); }
+  }
+
+  reportError(error) {
+    console.error(error);
+    this.components.appsignal?.sendError(error);
+  }
+
+  errorMessage(event) {
+    let errorContainer = this.shadow.getElementById("error-message");
+    errorContainer.classList.remove('hidden');
+    errorContainer.innerHTML = event.detail.message;
+  }
+
+  attachDonationFormToShadowDom() {
+    if (this.widgetClass.onAttach) {
+      this.widgetClass.onAttach(this);
+    }
+  }
+
+  isValidValue(attribute, value) {
+    switch (attribute) {
+      case 'modal':
+        return ['true', 'false'].includes(value);
+
+      case 'amount':
+        return value ? (!Number.isNaN(Number(value)) && Number(value) >= 0) : true;
+
+      case 'currency':
+        return Object.keys(this.campaignData.currencies).includes(value);
+
+      case 'interval':
+        return this.campaignData.intervals.includes(value);
+
+      case 'payment-method':
+        return true;
+
+      case 'country':
+        return !!value && value.length;
+
+      default:
+        return true;
+    }
+  }
+
+  attachStyles() {
+    const style = document.createElement('style');
+    style.textContent = `
+      div {
+        box-sizing: border-box;
+      }
+    `;
+    this.appendChild(style);
+  }
+
+  scrollToTop(event) {
+    if (event.detail.from) this.scrollIntoView(true);
+  }
+}
+
+
+(function addPreconnectLinks() {
+  const urls = [
+    '//cdn.jsdelivr.net',
+    '//doublethedonation.com',
+    '//js.stripe.com',
+    '//jspm.dev',
+    '//rsms.me',
+    '//www.google.com',
+  ];
+
+  const fragment = document.createDocumentFragment();
+
+  urls.forEach(url => {
+    const link = document.createElement('link');
+    link.rel = 'preconnect';
+    link.href = url;
+    fragment.appendChild(link);
+  });
+
+  document.head.appendChild(fragment);
+})();
+
+(function loadFonts() {
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = '//rsms.me/inter/inter.css';
+  document.head.appendChild(link);
+})();
+
+customElements.define("dbox-widget", DboxWidget);
